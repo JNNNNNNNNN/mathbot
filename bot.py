@@ -12,6 +12,7 @@ from discord.ext import tasks
 # CONFIGURACIÓN HARDCODEADA
 # =========================
 TOKEN = os.getenv("DISCORD_TOKEN")
+
 INFO_CHANNEL_ID = 1472747495162380481      # canal donde se envía el resumen
 PROBLEM_CHANNEL_ID = 1472720385618477271   # canal donde se envían los problemas
 
@@ -19,7 +20,7 @@ DB_PATH = "problems.db"
 JSON_PATH = "problems.json"
 
 TZ = ZoneInfo("Atlantic/Canary")
-SEND_TIME = time(hour=0, minute=12, tzinfo=TZ)
+SEND_TIME = time(hour=22, minute=32, tzinfo=TZ)
 
 # =========================
 # BASE DE DATOS
@@ -28,7 +29,7 @@ def db():
     return sqlite3.connect(DB_PATH)
 
 def init_db():
-    """Crea la tabla (con source) si no existe."""
+    """Crea la tabla (con source y skip_offset) si no existe."""
     with db() as con:
         con.execute(
             """
@@ -40,6 +41,36 @@ def init_db():
                 added_at TEXT NOT NULL
             )
             """
+        )
+        # Tabla para guardar el offset de skip global
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+            )
+            """
+        )
+        # Asegurar que existe la clave skip_offset
+        cur = con.execute("SELECT value FROM meta WHERE key = 'skip_offset'")
+        row = cur.fetchone()
+        if row is None:
+            con.execute(
+                "INSERT INTO meta(key, value) VALUES('skip_offset', 0)"
+            )
+        con.commit()
+
+def get_skip_offset() -> int:
+    with db() as con:
+        cur = con.execute("SELECT value FROM meta WHERE key = 'skip_offset'")
+        row = cur.fetchone()
+        return int(row[0]) if row else 0
+
+def set_skip_offset(value: int):
+    with db() as con:
+        con.execute(
+            "UPDATE meta SET value = ? WHERE key = 'skip_offset'",
+            (int(value),),
         )
         con.commit()
 
@@ -90,51 +121,6 @@ def import_json(json_path: str):
 
     print(f"Importados {added} problemas nuevos desde {json_path}")
 
-def pick_problem_by_number(n: int):
-    """
-    Devuelve el problema cuyo 'número' lógico es n,
-    es decir, el enésimo problema en orden de id ascendente.
-    No modifica la columna used.
-    """
-    if n <= 0:
-        return None
-
-    with db() as con:
-        row = con.execute(
-            "SELECT id, latex, source FROM problems ORDER BY id ASC LIMIT 1 OFFSET ?",
-            (n - 1,),
-        ).fetchone()
-
-        if row is None:
-            return None
-
-        pid, latex, source = row
-        return pid, latex, source
-
-def pick_next_problem():
-    """
-    Escoge el siguiente problema NO usado, en orden de inserción (id creciente).
-    Marca used = 1.
-    """
-    with db() as con:
-        row = con.execute(
-            "SELECT id, latex, source FROM problems "
-            "WHERE used = 0 ORDER BY id ASC LIMIT 1"
-        ).fetchone()
-
-        if row is None:
-            return None
-
-        pid, latex, source = row
-        con.execute("UPDATE problems SET used = 1 WHERE id = ?", (pid,))
-        con.commit()
-        return pid, latex, source
-
-def remaining_problems_count():
-    with db() as con:
-        cur = con.execute("SELECT COUNT(*) FROM problems WHERE used = 0")
-        return cur.fetchone()[0]
-
 def total_problems_count():
     with db() as con:
         cur = con.execute("SELECT COUNT(*) FROM problems")
@@ -145,14 +131,69 @@ def used_problems_count():
         cur = con.execute("SELECT COUNT(*) FROM problems WHERE used = 1")
         return cur.fetchone()[0]
 
+def remaining_problems_count():
+    with db() as con:
+        cur = con.execute("SELECT COUNT(*) FROM problems WHERE used = 0")
+        return cur.fetchone()[0]
+
+def get_problem_by_index(idx: int):
+    """
+    Devuelve el problema por índice lógico 1-based (ordenado por id ASC),
+    sin tocar 'used'.
+    """
+    if idx <= 0:
+        return None
+
+    with db() as con:
+        row = con.execute(
+            "SELECT id, latex, source FROM problems ORDER BY id ASC LIMIT 1 OFFSET ?",
+            (idx - 1,),
+        ).fetchone()
+
+        if row is None:
+            return None
+
+        pid, latex, source = row
+        return pid, latex, source
+
+def mark_used(pid: int):
+    with db() as con:
+        con.execute("UPDATE problems SET used = 1 WHERE id = ?", (pid,))
+        con.commit()
+
+def pick_next_with_skip():
+    """
+    Escoge el problema del día teniendo en cuenta:
+      - cuántos ya se han usado (usados),
+      - el offset global de skip (skip_offset).
+    Índice lógico = usados + 1 + skip_offset.
+    Marca used = 1 para ese problema.
+    """
+    usados = used_problems_count()
+    skip = get_skip_offset()
+    total = total_problems_count()
+
+    logical_index = usados + 1 + skip
+    if logical_index > total:
+        return None
+
+    result = get_problem_by_index(logical_index)
+    if result is None:
+        return None
+
+    pid, latex, source = result
+    mark_used(pid)
+    return logical_index, latex, source
+
 # =========================
 # BOT
 # =========================
 class Bot(discord.Client):
     def __init__(self):
+        # Necesitamos message_content para !skip
         intents = discord.Intents.default()
-        intents.message_content = True   # necesario para leer !skip
-        intents.members = False          # desactivar intents privilegiados
+        intents.message_content = True   # ACTIVA Message Content Intent en el portal
+        intents.members = False
         intents.presences = False
         super().__init__(intents=intents)
 
@@ -175,13 +216,15 @@ async def on_ready():
     total = total_problems_count()
     usados = used_problems_count()
     restantes = remaining_problems_count()
-    numero_siguiente = usados + 1  # número de problema por el que va
+    skip = get_skip_offset()
+    numero_siguiente_logico = usados + 1 + skip
 
     mensaje_info = (
         f"📊 Problemas en la base de datos: {total}\n"
-        f"✅ Ya enviados: {usados}\n"
-        f"🕒 Pendientes: {restantes}\n"
-        f"➡️ Próximo problema: #{numero_siguiente}"
+        f"✅ Ya enviados (marcados como usados): {usados}\n"
+        f"🕒 Pendientes (unused): {restantes}\n"
+        f"⏭ Offset de skip actual: {skip}\n"
+        f"➡️ Próximo problema lógico (con skip): #{numero_siguiente_logico}"
     )
 
     await info_channel.send(mensaje_info)
@@ -192,41 +235,42 @@ async def on_message(message: discord.Message):
     if message.author == bot.user:
         return
 
-    # Comando: !skip <numero>
+    # Comando: !skip <n>
+    # Interpreta n como "hoy quiero saltar al problema n"
+    # Es decir, hoy se enviará el problema con índice lógico n.
     if message.content.startswith("!skip"):
         parts = message.content.split()
         if len(parts) != 2 or not parts[1].isdigit():
-            await message.channel.send("Uso: `!skip <número_de_problema>`")
+            await message.channel.send("Uso: `!skip <número_de_problema_que_quieres_para_hoy>`")
             return
 
         n = int(parts[1])
         total = total_problems_count()
+        if total == 0:
+            await message.channel.send("No hay problemas en la base de datos.")
+            return
+
         if n <= 0 or n > total:
+            await message.channel.send(f"El número debe estar entre 1 y {total}.")
+            return
+
+        usados = used_problems_count()
+        # Queremos que el problema del día sea el índice lógico n:
+        # usados + 1 + skip_offset = n  => skip_offset = n - (usados + 1)
+        nuevo_skip = n - (usados + 1)
+        if nuevo_skip < 0:
             await message.channel.send(
-                f"El número debe estar entre 1 y {total}."
+                f"El problema #{n} ya está por detrás del progreso actual (usados = {usados})."
             )
             return
 
-        result = pick_problem_by_number(n)
-        if result is None:
-            await message.channel.send("No se encontró ese problema en la base de datos.")
-            return
+        set_skip_offset(nuevo_skip)
 
-        pid, latex, source = result
-        mensaje = f"```latex\n{latex}\n```"
-        if source:
-            fuente_msg = f"Fuente || {source} ||"
-        else:
-            fuente_msg = "Fuente || [fuente no especificada] ||"
-
-        encabezado = f"📌 Problema #{n} (enviado manualmente con !skip)"
-        await message.channel.send(encabezado)
-        await message.channel.send(mensaje)
-        await message.channel.send(fuente_msg)
+        await message.channel.send(
+            f"✅ Hoy se configuró para enviar el problema #{n}.\n"
+            f"(usados = {usados}, skip_offset = {nuevo_skip})"
+        )
         return
-
-    # No usamos commands.Bot, así que no hay process_commands real
-    # (dejamos este hook vacío para futuras extensiones)
 
 @tasks.loop(time=SEND_TIME)
 async def daily_problem():
@@ -237,18 +281,22 @@ async def daily_problem():
     # Cada día intentamos importar nuevos problemas del JSON
     import_json(JSON_PATH)
 
+    total = total_problems_count()
+    if total == 0:
+        await problem_channel.send("❌ No hay problemas en la base de datos.")
+        return
+
     restantes = remaining_problems_count()
     if restantes == 0:
-        await problem_channel.send("❌ Faltan problemas en la base de datos.")
+        await problem_channel.send("❌ Faltan problemas en la base de datos (todos usados).")
         return
 
-    picked = pick_next_problem()
+    picked = pick_next_with_skip()
     if picked is None:
-        await problem_channel.send("❌ Faltan problemas en la base de datos.")
+        await problem_channel.send("❌ No hay problema disponible con el skip actual.")
         return
 
-    pid, latex, source = picked
-    numero_problema = used_problems_count()  # ya incluye el recién marcado
+    logical_index, latex, source = picked
 
     mensaje = f"```latex\n{latex}\n```"
     if source:
@@ -256,7 +304,7 @@ async def daily_problem():
     else:
         fuente_msg = "Fuente || [fuente no especificada] ||"
 
-    encabezado = f"📌 Problema #{numero_problema}"
+    encabezado = f"📌 Problema #{logical_index}"
     print("VOY A ENVIAR:", repr(encabezado), repr(mensaje), repr(fuente_msg))
 
     await problem_channel.send(encabezado)
@@ -265,7 +313,7 @@ async def daily_problem():
 
 if __name__ == "__main__":
     if not TOKEN:
-        raise RuntimeError("Falta DISCORD_TOKEN (TOKEN está vacío).")
+        raise RuntimeError("TOKEN está vacío.")
 
     init_db()
     import_json(JSON_PATH)
