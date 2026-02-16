@@ -151,7 +151,9 @@ def used_problems_count():
 class Bot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
-        intents.message_content = True  # necesario para leer comandos tipo !skip
+        intents.message_content = True   # necesario para leer !skip
+        intents.members = False          # desactivar intents privilegiados
+        intents.presences = False
         super().__init__(intents=intents)
 
     async def setup_hook(self):
@@ -223,8 +225,8 @@ async def on_message(message: discord.Message):
         await message.channel.send(fuente_msg)
         return
 
-    # Importante: permitir que otros eventos (como commands/loops) sigan funcionando
-    await bot.process_commands(message) if hasattr(bot, "process_commands") else None
+    # No usamos commands.Bot, así que no hay process_commands real
+    # (dejamos este hook vacío para futuras extensiones)
 
 @tasks.loop(time=SEND_TIME)
 async def daily_problem():
