@@ -18,7 +18,7 @@ DB_PATH = "problems.db"
 JSON_PATH = "problems.json"
 
 TZ = ZoneInfo("Atlantic/Canary")
-SEND_TIME = time(hour=23, minute=20, tzinfo=TZ)
+SEND_TIME = time(hour=0, minute=9, tzinfo=TZ)
 
 # =========================
 # BASE DE DATOS
