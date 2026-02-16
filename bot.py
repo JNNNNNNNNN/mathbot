@@ -11,8 +11,9 @@ from discord.ext import tasks
 # =========================
 # CONFIGURACIÓN HARDCODEADA
 # =========================
-TOKEN = os.getenv("DISCORD_TOKEN")  # CAMBIA ESTO
-CHANNEL_ID = 1472720385618477271
+TOKEN = os.getenv("DISCORD_TOKEN")
+INFO_CHANNEL_ID = 1472747495162380481      # canal donde se envía el resumen
+PROBLEM_CHANNEL_ID = 1472720385618477271   # canal donde se envían los problemas
 
 DB_PATH = "problems.db"
 JSON_PATH = "problems.json"
@@ -89,10 +90,31 @@ def import_json(json_path: str):
 
     print(f"Importados {added} problemas nuevos desde {json_path}")
 
+def pick_problem_by_number(n: int):
+    """
+    Devuelve el problema cuyo 'número' lógico es n,
+    es decir, el enésimo problema en orden de id ascendente.
+    No modifica la columna used.
+    """
+    if n <= 0:
+        return None
+
+    with db() as con:
+        row = con.execute(
+            "SELECT id, latex, source FROM problems ORDER BY id ASC LIMIT 1 OFFSET ?",
+            (n - 1,),
+        ).fetchone()
+
+        if row is None:
+            return None
+
+        pid, latex, source = row
+        return pid, latex, source
+
 def pick_next_problem():
     """
     Escoge el siguiente problema NO usado, en orden de inserción (id creciente).
-    No resetea jamás el 'used': cada problema se usa como máximo una vez.
+    Marca used = 1.
     """
     with db() as con:
         row = con.execute(
@@ -129,6 +151,7 @@ def used_problems_count():
 class Bot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
+        intents.message_content = True  # necesario para leer comandos tipo !skip
         super().__init__(intents=intents)
 
     async def setup_hook(self):
@@ -139,12 +162,13 @@ bot = Bot()
 @bot.event
 async def on_ready():
     print(f"Conectado como {bot.user} (id={bot.user.id})")
-    print(f"Canal objetivo: {CHANNEL_ID}")
+    print(f"Canal de info: {INFO_CHANNEL_ID}")
+    print(f"Canal de problemas: {PROBLEM_CHANNEL_ID}")
     print(f"Hora diaria (Canarias): {SEND_TIME}")
 
-    channel = bot.get_channel(CHANNEL_ID)
-    if channel is None:
-        channel = await bot.fetch_channel(CHANNEL_ID)
+    info_channel = bot.get_channel(INFO_CHANNEL_ID)
+    if info_channel is None:
+        info_channel = await bot.fetch_channel(INFO_CHANNEL_ID)
 
     total = total_problems_count()
     usados = used_problems_count()
@@ -158,29 +182,71 @@ async def on_ready():
         f"➡️ Próximo problema: #{numero_siguiente}"
     )
 
-    await channel.send(mensaje_info)
+    await info_channel.send(mensaje_info)
+
+@bot.event
+async def on_message(message: discord.Message):
+    # Ignorar mensajes del propio bot
+    if message.author == bot.user:
+        return
+
+    # Comando: !skip <numero>
+    if message.content.startswith("!skip"):
+        parts = message.content.split()
+        if len(parts) != 2 or not parts[1].isdigit():
+            await message.channel.send("Uso: `!skip <número_de_problema>`")
+            return
+
+        n = int(parts[1])
+        total = total_problems_count()
+        if n <= 0 or n > total:
+            await message.channel.send(
+                f"El número debe estar entre 1 y {total}."
+            )
+            return
+
+        result = pick_problem_by_number(n)
+        if result is None:
+            await message.channel.send("No se encontró ese problema en la base de datos.")
+            return
+
+        pid, latex, source = result
+        mensaje = f"```latex\n{latex}\n```"
+        if source:
+            fuente_msg = f"Fuente || {source} ||"
+        else:
+            fuente_msg = "Fuente || [fuente no especificada] ||"
+
+        encabezado = f"📌 Problema #{n} (enviado manualmente con !skip)"
+        await message.channel.send(encabezado)
+        await message.channel.send(mensaje)
+        await message.channel.send(fuente_msg)
+        return
+
+    # Importante: permitir que otros eventos (como commands/loops) sigan funcionando
+    await bot.process_commands(message) if hasattr(bot, "process_commands") else None
 
 @tasks.loop(time=SEND_TIME)
 async def daily_problem():
-    channel = bot.get_channel(CHANNEL_ID)
-    if channel is None:
-        channel = await bot.fetch_channel(CHANNEL_ID)
+    problem_channel = bot.get_channel(PROBLEM_CHANNEL_ID)
+    if problem_channel is None:
+        problem_channel = await bot.fetch_channel(PROBLEM_CHANNEL_ID)
 
-    # Intentamos importar nuevos problemas del JSON cada día
+    # Cada día intentamos importar nuevos problemas del JSON
     import_json(JSON_PATH)
 
     restantes = remaining_problems_count()
     if restantes == 0:
-        await channel.send("❌ Faltan problemas en la base de datos.")
+        await problem_channel.send("❌ Faltan problemas en la base de datos.")
         return
 
     picked = pick_next_problem()
     if picked is None:
-        await channel.send("❌ Faltan problemas en la base de datos.")
+        await problem_channel.send("❌ Faltan problemas en la base de datos.")
         return
 
     pid, latex, source = picked
-    numero_problema = used_problems_count()  # ya incluye el que acabamos de marcar
+    numero_problema = used_problems_count()  # ya incluye el recién marcado
 
     mensaje = f"```latex\n{latex}\n```"
     if source:
@@ -191,16 +257,15 @@ async def daily_problem():
     encabezado = f"📌 Problema #{numero_problema}"
     print("VOY A ENVIAR:", repr(encabezado), repr(mensaje), repr(fuente_msg))
 
-    await channel.send(encabezado)
-    await channel.send(mensaje)
-    await channel.send(fuente_msg)
+    await problem_channel.send(encabezado)
+    await problem_channel.send(mensaje)
+    await problem_channel.send(fuente_msg)
 
 if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("Falta DISCORD_TOKEN (TOKEN está vacío).")
 
     init_db()
-    # Importamos posibles problemas nuevos al arrancar
     import_json(JSON_PATH)
 
     bot.run(TOKEN)
