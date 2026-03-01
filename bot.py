@@ -3,7 +3,6 @@ import sqlite3
 import os
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
-import asyncio
 
 import discord
 from discord.ext import tasks
@@ -15,12 +14,16 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 
 INFO_CHANNEL_ID = 1472747495162380481      # canal donde se envía el resumen
 PROBLEM_CHANNEL_ID = 1472720385618477271   # canal donde se envían los problemas
+HORA_CHANNEL_ID = 1477113428257673246      # canal donde se envía el embed de !hora
 
 DB_PATH = "problems.db"
 JSON_PATH = "problems.json"
 
 TZ = ZoneInfo("Atlantic/Canary")
 SEND_TIME = time(hour=21, minute=30, tzinfo=TZ)
+
+# Reacciones para el cuestionario de hora (inicio)
+HORA_REACTIONS = ["1️⃣", "2️⃣", "3️⃣"]  # 11, 12, 13
 
 # =========================
 # BASE DE DATOS
@@ -42,7 +45,6 @@ def init_db():
             )
             """
         )
-        # Tabla para guardar el offset de skip global
         con.execute(
             """
             CREATE TABLE IF NOT EXISTS meta (
@@ -51,13 +53,10 @@ def init_db():
             )
             """
         )
-        # Asegurar que existe la clave skip_offset
         cur = con.execute("SELECT value FROM meta WHERE key = 'skip_offset'")
         row = cur.fetchone()
         if row is None:
-            con.execute(
-                "INSERT INTO meta(key, value) VALUES('skip_offset', 0)"
-            )
+            con.execute("INSERT INTO meta(key, value) VALUES('skip_offset', 0)")
         con.commit()
 
 def get_skip_offset() -> int:
@@ -102,7 +101,6 @@ def import_json(json_path: str):
             source = str(it.get("source", "")).strip()
             added_at = datetime.now(tz=TZ).isoformat()
 
-            # Evitar duplicados exactos de latex + source
             cur = con.execute(
                 "SELECT COUNT(*) FROM problems WHERE latex = ? AND source = ?",
                 (latex, source),
@@ -112,8 +110,7 @@ def import_json(json_path: str):
                 continue
 
             con.execute(
-                "INSERT INTO problems(latex, source, used, added_at) "
-                "VALUES (?, ?, 0, ?)",
+                "INSERT INTO problems(latex, source, used, added_at) VALUES (?, ?, 0, ?)",
                 (latex, source, added_at),
             )
             added += 1
@@ -190,12 +187,15 @@ def pick_next_with_skip():
 # =========================
 class Bot(discord.Client):
     def __init__(self):
-        # Necesitamos message_content para !skip
         intents = discord.Intents.default()
-        intents.message_content = True   # ACTIVA Message Content Intent en el portal
+        intents.message_content = True  # necesario para leer !skip y !hora
         intents.members = False
         intents.presences = False
         super().__init__(intents=intents)
+
+        # Guardamos el último mensaje de encuesta !hora para validación
+        self.hora_poll_message_id = None
+        self.hora_poll_channel_id = HORA_CHANNEL_ID
 
     async def setup_hook(self):
         daily_problem.start()
@@ -207,6 +207,7 @@ async def on_ready():
     print(f"Conectado como {bot.user} (id={bot.user.id})")
     print(f"Canal de info: {INFO_CHANNEL_ID}")
     print(f"Canal de problemas: {PROBLEM_CHANNEL_ID}")
+    print(f"Canal de !hora: {HORA_CHANNEL_ID}")
     print(f"Hora diaria (Canarias): {SEND_TIME}")
 
     info_channel = bot.get_channel(INFO_CHANNEL_ID)
@@ -229,15 +230,46 @@ async def on_ready():
 
     await info_channel.send(mensaje_info)
 
+async def send_hora_poll(trigger_channel: discord.abc.Messageable, author: discord.User):
+    """
+    Envía un embed con encuesta al canal HORA_CHANNEL_ID y añade 3 reacciones.
+    """
+    channel = bot.get_channel(HORA_CHANNEL_ID)
+    if channel is None:
+        channel = await bot.fetch_channel(HORA_CHANNEL_ID)
+
+    embed = discord.Embed(
+        title="🗓️ Próxima reunión: elige hora de inicio",
+        description=(
+            "¿A qué hora quieres que empiece?\n\n"
+            "1️⃣ 11:00\n"
+            "2️⃣ 12:00\n"
+            "3️⃣ 13:00\n\n"
+            "Reacciona abajo con tu opción."
+        ),
+        color=0x5865F2,
+        timestamp=datetime.now(tz=TZ),
+    )
+    embed.set_footer(text=f"Solicitado por: {author}")
+
+    msg = await channel.send(embed=embed)
+    bot.hora_poll_message_id = msg.id
+    bot.hora_poll_channel_id = channel.id
+
+    # Añadimos reacciones (unicode emojis)
+    for e in HORA_REACTIONS:
+        await msg.add_reaction(e)  # unicode o custom emoji válido [web:2]
+
+    # Confirmación opcional en el canal donde se invoca
+    if trigger_channel and hasattr(trigger_channel, "send") and trigger_channel != channel:
+        await trigger_channel.send(f"✅ Encuesta enviada en <#{channel.id}>.")
+
 @bot.event
 async def on_message(message: discord.Message):
-    # Ignorar mensajes del propio bot
     if message.author == bot.user:
         return
 
     # Comando: !skip <n>
-    # Interpreta n como "hoy quiero saltar al problema n"
-    # Es decir, hoy se enviará el problema con índice lógico n.
     if message.content.startswith("!skip"):
         parts = message.content.split()
         if len(parts) != 2 or not parts[1].isdigit():
@@ -255,8 +287,6 @@ async def on_message(message: discord.Message):
             return
 
         usados = used_problems_count()
-        # Queremos que el problema del día sea el índice lógico n:
-        # usados + 1 + skip_offset = n  => skip_offset = n - (usados + 1)
         nuevo_skip = n - (usados + 1)
         if nuevo_skip < 0:
             await message.channel.send(
@@ -272,13 +302,56 @@ async def on_message(message: discord.Message):
         )
         return
 
+    # Comando: !hora
+    if message.content.strip() == "!hora":
+        await send_hora_poll(message.channel, message.author)
+        return
+
+@bot.event
+async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
+    """
+    Valida reacciones: solo cuenta si es en el mensaje de encuesta y si está
+    dentro de las 3 reacciones permitidas. [web:6]
+    """
+    if user.bot:
+        return
+
+    if bot.hora_poll_message_id is None:
+        return
+
+    if reaction.message.id != bot.hora_poll_message_id:
+        return
+
+    if reaction.message.channel.id != bot.hora_poll_channel_id:
+        return
+
+    if str(reaction.emoji) not in HORA_REACTIONS:
+        # Si reaccionan con otra cosa, la quitamos (requiere permisos Manage Messages)
+        try:
+            await reaction.message.remove_reaction(reaction.emoji, user)
+        except discord.Forbidden:
+            pass
+        except discord.HTTPException:
+            pass
+        return
+
+    # Opcional: si quieres que cada usuario solo pueda votar una opción,
+    # quitamos sus otras reacciones permitidas en ese mismo mensaje.
+    try:
+        for e in HORA_REACTIONS:
+            if e != str(reaction.emoji):
+                await reaction.message.remove_reaction(e, user)
+    except discord.Forbidden:
+        pass
+    except discord.HTTPException:
+        pass
+
 @tasks.loop(time=SEND_TIME)
 async def daily_problem():
     problem_channel = bot.get_channel(PROBLEM_CHANNEL_ID)
     if problem_channel is None:
         problem_channel = await bot.fetch_channel(PROBLEM_CHANNEL_ID)
 
-    # Cada día intentamos importar nuevos problemas del JSON
     import_json(JSON_PATH)
 
     total = total_problems_count()
