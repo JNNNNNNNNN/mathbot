@@ -242,9 +242,9 @@ async def send_hora_poll(trigger_channel: discord.abc.Messageable, author: disco
         title="🗓️ Próxima reunión: elige hora de inicio",
         description=(
             "¿A qué hora quieres que empiece?\n\n"
-            "1️⃣ 11:00\n"
-            "2️⃣ 12:00\n"
-            "3️⃣ 13:00\n\n"
+            "1️⃣ 23:00\n"
+            "2️⃣ 00:00\n"
+            "3️⃣ 01:00\n\n"
             "Reacciona abajo con tu opción."
         ),
         color=0x5865F2,
